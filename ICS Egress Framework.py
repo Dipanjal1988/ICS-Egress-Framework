@@ -1,16 +1,16 @@
 import streamlit as st
 
-import json
-
 import re
 
-from datetime import datetime, timedelta
+import json
 
 from pathlib import Path
 
+from datetime import datetime, timedelta
 
 
-# ---------------- Page Setup ----------------
+
+# ---------- Setup ----------
 
 st.set_page_config(page_title="ICS Egress Framework", layout="wide")
 
@@ -18,7 +18,7 @@ st.title("ICS Egress Framework")
 
 
 
-# ---------------- Login ----------------
+# ---------- Login ----------
 
 if "authenticated" not in st.session_state:
 
@@ -46,49 +46,89 @@ if not st.session_state.authenticated:
 
 
 
-# ---------------- Tabs ----------------
+# ---------- Tabs ----------
 
-tabs = st.tabs(["Code Preview", "SQL Config", "Generated SQL", "Execution JSON", "Generated Export Job", "Generated DAG"])
+tabs = st.tabs([
 
-code_tab, sql_config_tab, sql_tab, execution_tab, export_tab, dag_tab = tabs
+    "Code Preview",
 
+    "SQL Config",
 
+    "Generated SQL",
 
-# ---------------- Helper Functions ----------------
+    "Execution JSON",
 
-def extract_sql_components(script_text):
+    "Generated Export Job",
 
-    # Extracting basic SQL elements
+    "Generated DAG"
 
-    select = re.search(r"SELECT\s+(.*?)\s+FROM", script_text, re.IGNORECASE | re.DOTALL)
-
-    where = re.search(r"WHERE\s+(.*?)(GROUP BY|ORDER BY|LIMIT|$)", script_text, re.IGNORECASE | re.DOTALL)
-
-    with_ = re.search(r"WITH\s+(.*?)\s+SELECT", script_text, re.IGNORECASE | re.DOTALL)
-
-    interval = re.search(r"INTERVAL\s+(\d+)\s+(HOUR|DAY|MINUTE)", script_text, re.IGNORECASE)
+])
 
 
 
-    columns = select.group(1).strip() if select else "*"
+# ---------- Helper Functions ----------
 
-    where_clause = where.group(1).strip() if where else ""
+def parse_sql_and_non_sql(script_text):
 
-    with_clause = with_.group(1).strip() if with_ else ""
+    sql_blocks = re.findall(r'(SELECT\s+.*?;)', script_text, re.IGNORECASE | re.DOTALL)
 
-    schedule = "0 * * * *" if interval else "0 3 * * *"
-
-    
-
-    tables = list(set(re.findall(r'\bFROM\s+([a-zA-Z0-9_.]+)', script_text, re.IGNORECASE)))
-
-    return columns, where_clause, with_clause, schedule, tables
+    non_sql = re.sub(r'(SELECT\s+.*?;)', '', script_text, flags=re.IGNORECASE | re.DOTALL).strip()
 
 
 
-def generate_export_script(sql, destination_path):
+    source_tables = re.findall(r'FROM\s+([a-zA-Z0-9_.]+)', ' '.join(sql_blocks), re.IGNORECASE)
 
-    return f'''from google.cloud import bigquery
+    columns = re.findall(r'SELECT\s+(.*?)\s+FROM', ' '.join(sql_blocks), re.IGNORECASE | re.DOTALL)
+
+    columns_flat = [col.strip() for sub in columns for col in sub.split(',')]
+
+
+
+    target = re.search(r'EXPORT\s+FILE\s*=\s*[\'"]([^\'"]+)[\'"]', script_text, re.IGNORECASE)
+
+    destination = target.group(1) if target else "/tmp/output.csv"
+
+
+
+    sql_config = {
+
+        "source_schema": [{"table": tbl, "columns": columns_flat} for tbl in source_tables],
+
+        "target_schema": [{"destination": destination}],
+
+        "sql_logic": ' '.join(sql_blocks).strip()
+
+    }
+
+
+
+    execution_json = {
+
+        "job_name": "parsed_egress_job",
+
+        "execution_condition": [line.strip() for line in non_sql.splitlines() if "if" in line.lower() or ".quit" in line.lower()],
+
+        "command_logic": "bteq < job.bteq",
+
+        "schedule": "0 3 * * *",
+
+        "retries": 1,
+
+        "delay_minutes": 5
+
+    }
+
+
+
+    return sql_config, execution_json
+
+
+
+def generate_export_script(sql_logic, destination):
+
+    return f"""
+
+from google.cloud import bigquery
 
 import pandas as pd
 
@@ -96,29 +136,23 @@ import pandas as pd
 
 client = bigquery.Client()
 
-sql_query = """{sql}"""
+query = \"\"\"{sql_logic}\"\"\"
 
-df = client.query(sql_query).to_dataframe()
+df = client.query(query).to_dataframe()
 
+df.to_csv("{destination}", index=False)
 
+print("Export complete: {destination}")
 
-if df.empty:
-
-    print("No data to export.")
-
-else:
-
-    df.to_csv("{destination_path}", index=False)
-
-    print("Data exported successfully to {destination_path}")
-
-'''
+""".strip()
 
 
 
-def generate_dag_script(job_name, export_filename, execution_json):
+def generate_dag_code(job_name, export_script, exec_json):
 
-    return f'''from airflow import DAG
+    return f"""
+
+from airflow import DAG
 
 from airflow.operators.python import PythonOperator
 
@@ -134,23 +168,13 @@ import subprocess
 
 def check_export_exists():
 
-    return os.path.exists("{export_filename}")
+    return os.path.exists("{export_script}")
 
 
 
-def execute_logic():
+def execute_export_job():
 
-    try:
-
-        result = subprocess.run("{execution_json['command_logic']}", shell=True, check=True)
-
-        print("Execution successful.")
-
-    except subprocess.CalledProcessError as e:
-
-        print("Execution failed:", e)
-
-        raise
+    subprocess.run("python {export_script}", shell=True, check=True)
 
 
 
@@ -158,9 +182,9 @@ default_args = {{
 
     'owner': 'airflow',
 
-    'retries': {execution_json['retries']},
+    'retries': {exec_json['retries']},
 
-    'retry_delay': timedelta(minutes={execution_json['delay_minutes']})
+    'retry_delay': timedelta(minutes={exec_json['delay_minutes']})
 
 }}
 
@@ -172,7 +196,7 @@ with DAG(
 
     default_args=default_args,
 
-    schedule_interval="{execution_json['schedule']}",
+    schedule_interval="{exec_json['schedule']}",
 
     start_date=datetime(2024, 1, 1),
 
@@ -184,7 +208,7 @@ with DAG(
 
     check_file = ShortCircuitOperator(
 
-        task_id='check_export_script',
+        task_id="check_export_script",
 
         python_callable=check_export_exists
 
@@ -192,69 +216,63 @@ with DAG(
 
 
 
-    run_job = PythonOperator(
+    run_export = PythonOperator(
 
-        task_id='execute_export_job',
+        task_id="run_export_job",
 
-        python_callable=execute_logic
+        python_callable=execute_export_job
 
     )
 
 
 
-    check_file >> run_job
+    check_file >> run_export
 
-'''
+""".strip()
 
 
 
-# ---------------- File Upload ----------------
+# ---------- Tab 1: Code Upload ----------
 
-with code_tab:
+with tabs[0]:
 
-    st.subheader("Upload egress job script")
+    st.subheader("Code Preview")
 
-    uploaded_file = st.file_uploader("Upload .sql, .bteq, .txt, .py, .sh, .java, .cs", type=["sql", "bteq", "txt", "py", "sh", "java", "cs"])
+    uploaded_file = st.file_uploader("Upload an egress script", type=["bteq", "sql", "txt", "py", "sh", "java", "cs"])
 
     if uploaded_file:
 
-        script_text = uploaded_file.read().decode("utf-8")
+        code_text = uploaded_file.read().decode("utf-8")
 
-        st.text_area("Code Preview", script_text, height=300)
+        st.session_state.code_text = code_text
 
-        st.session_state.script = script_text
-
-        st.session_state.job_name = Path(uploaded_file.name).stem
+        st.text_area("Raw Code", code_text, height=300)
 
 
 
-# ---------------- SQL Config Tab ----------------
+# ---------- Process Once Uploaded ----------
 
-if "script" in st.session_state:
+if "code_text" in st.session_state:
 
-    with sql_config_tab:
+    code = st.session_state.code_text
 
-        cols, where, with_, sched, tables = extract_sql_components(st.session_state.script)
+    sql_config, exec_json = parse_sql_and_non_sql(code)
 
-        sql_config = {
+    job_name = Path(uploaded_file.name).stem
 
-            "job_name": st.session_state.job_name,
+    st.session_state.job_name = job_name
 
-            "source_tables": tables,
+    st.session_state.sql_config = sql_config
 
-            "columns": cols,
+    st.session_state.exec_json = exec_json
 
-            "with_clause": with_,
 
-            "where_clause": where,
 
-            "sql_logic": st.session_state.script.strip()
+    # ---------- Tab 2: SQL Config ----------
 
-        }
+    with tabs[1]:
 
-        st.session_state.sql_config = sql_config
-
-        st.subheader("SQL Config")
+        st.subheader("SQL Config JSON")
 
         st.json(sql_config)
 
@@ -262,43 +280,21 @@ if "script" in st.session_state:
 
 
 
-# ---------------- SQL Logic ----------------
+    # ---------- Tab 3: Generated SQL ----------
 
-if "sql_config" in st.session_state:
+    with tabs[2]:
 
-    with sql_tab:
+        st.subheader("SQL Logic")
 
-        st.subheader("Generated SQL Logic")
+        st.code(sql_config["sql_logic"], language="sql")
 
-        sql = st.session_state.sql_config['sql_logic']
-
-        st.code(sql, language="sql")
-
-        st.download_button("Download SQL", sql, file_name="generated_query.sql")
+        st.download_button("Download SQL", sql_config["sql_logic"], file_name="egress_query.sql")
 
 
 
-# ---------------- Execution JSON ----------------
+    # ---------- Tab 4: Execution JSON ----------
 
-    with execution_tab:
-
-        exec_json = {
-
-            "job_name": st.session_state.job_name,
-
-            "execution_condition": ["if errorcode <> 0 then .quit 1;"],
-
-            "command_logic": f"python {st.session_state.job_name}_export.py",
-
-            "schedule": sched,
-
-            "retries": 1,
-
-            "delay_minutes": 5
-
-        }
-
-        st.session_state.exec_json = exec_json
+    with tabs[3]:
 
         st.subheader("Execution JSON")
 
@@ -308,30 +304,30 @@ if "sql_config" in st.session_state:
 
 
 
-# ---------------- Export Job Script ----------------
+    # ---------- Tab 5: Export Script ----------
 
-    with export_tab:
+    with tabs[4]:
 
-        st.subheader("Generated Export Job (Python)")
+        st.subheader("Generated Export Python Script")
 
-        export_path = f"/sftp/{st.session_state.job_name}_data.csv"
+        export_path = sql_config["target_schema"][0]["destination"]
 
-        export_code = generate_export_script(sql, export_path)
+        export_script = generate_export_script(sql_config["sql_logic"], export_path)
 
-        st.code(export_code, language="python")
+        st.code(export_script, language="python")
 
-        st.download_button("Download Export Script", export_code, file_name=f"{st.session_state.job_name}_export.py")
+        st.download_button("Download Export Script", export_script, file_name=f"{job_name}_export.py")
 
 
 
-# ---------------- DAG Generation ----------------
+    # ---------- Tab 6: DAG ----------
 
-    with dag_tab:
+    with tabs[5]:
 
         st.subheader("Generated Airflow DAG")
 
-        dag_code = generate_dag_script(st.session_state.job_name, f"{st.session_state.job_name}_export.py", st.session_state.exec_json)
+        dag_code = generate_dag_code(job_name, f"{job_name}_export.py", exec_json)
 
         st.code(dag_code, language="python")
 
-        st.download_button("Download DAG", dag_code, file_name=f"{st.session_state.job_name}_dag.py")
+        st.download_button("Download DAG", dag_code, file_name=f"{job_name}_dag.py")
